@@ -1,3 +1,26 @@
+/*
+ * =====================================================================================
+ *
+ * Filename:  index.js
+ *
+ * Description:  在线剪贴板 Cloudflare Worker
+ * - 支持登录验证
+ * - 支持文本、文件（通过URL）的跨设备同步
+ * - 支持创建、管理、修改、删除带权限（查看次数、有效期）的分享链接
+ *
+ * Version:  2.0
+ * Created:  2024-05-10
+ * Revision:  2025-06-27 (新增分享管理功能)
+ *
+ * =====================================================================================
+ */
+
+
+// 部署前，请确保已经在 Cloudflare Worker 的设置中完成了两件事：
+// 1. 绑定了一个 KV Namespace，并将其命名为 `JTB`。
+// 2. 在环境变量 (Environment Variables) 中设置了 `USER` 和 `PASSWORD` 用于登录。
+
+
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request))
 })
@@ -85,7 +108,10 @@ async function handleRequest(request) {
   // 3. 对所有其他路由进行身份验证
   const authenticated = await isAuthenticated(request);
   if (!authenticated) {
-    // 如果未登录，重定向到登录页面
+    // 如果是API请求，返回401，否则重定向
+    if (path.startsWith('/api/')) {
+        return new Response('Unauthorized', { status: 401 });
+    }
     return Response.redirect(`${url.origin}/login`, 302);
   }
 
@@ -128,11 +154,66 @@ async function handleRequest(request) {
     const shareId = generateUUID();
     const expireAt = validMinutes ? Date.now() + validMinutes * 60 * 1000 : null;
 
-    await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: 0 }), { expirationTtl: validMinutes ? validMinutes * 60 : undefined });
+    // expirationTtl的单位是秒
+    const expirationTtl = validMinutes ? validMinutes * 60 : undefined;
+
+    await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: 0 }), { expirationTtl });
 
     const shareUrl = `${url.origin}/s/${shareId}`;
-    return new Response(JSON.stringify({ shareUrl }));
+    return new Response(JSON.stringify({ shareUrl }), { headers: { 'Content-Type': 'application/json' }});
+  } 
+  
+  // --- 新增的管理分享链接的API ---
+  else if (path === '/api/shares' && request.method === 'GET') {
+    const list = await JTB.list();
+    let shares = [];
+    for (const key of list.keys) {
+      // 过滤掉非分享链接的key (例如 session:..., clipboard)
+      if (key.name.includes('-') && key.name.length === 36) { // 简单的UUID判断
+        const data = await JTB.get(key.name);
+        if (data) {
+          try {
+            const shareData = JSON.parse(data);
+            shares.push({
+              id: key.name,
+              url: `${url.origin}/s/${key.name}`,
+              ...shareData
+            });
+          } catch(e) {
+            // 忽略无法解析的脏数据
+          }
+        }
+      }
+    }
+    // 按创建时间排序（假设时间戳在expireAt中，越大的越新）
+    shares.sort((a, b) => (b.expireAt || Infinity) - (a.expireAt || Infinity));
+    return new Response(JSON.stringify(shares), { headers: { 'Content-Type': 'application/json' } });
+  } 
+  else if (path.startsWith('/api/shares/') && request.method === 'DELETE') {
+    const shareId = path.substring('/api/shares/'.length);
+    await JTB.delete(shareId);
+    return new Response('删除成功', { status: 200 });
+  } 
+  else if (path.startsWith('/api/shares/') && request.method === 'PUT') {
+    const shareId = path.substring('/api/shares/'.length);
+    const existingData = await JTB.get(shareId);
+
+    if (!existingData) {
+        return new Response('分享链接不存在', { status: 404 });
+    }
+
+    const updates = await request.json();
+    const data = JSON.parse(existingData);
+
+    // 更新数据
+    data.maxViews = updates.maxViews ? parseInt(updates.maxViews) : null;
+    data.expireAt = updates.validMinutes ? Date.now() + parseInt(updates.validMinutes) * 60 * 1000 : null;
+    const expirationTtl = updates.validMinutes ? parseInt(updates.validMinutes) * 60 : undefined;
+
+    await JTB.put(shareId, JSON.stringify(data), { expirationTtl });
+    return new Response('更新成功', { status: 200 });
   }
+
 
   // 其他未找到的路径返回404
   return new Response('未找到', { status: 404 });
@@ -148,7 +229,7 @@ async function isAuthenticated(request) {
     const cookies = cookieHeader.split(';');
     for (let cookie of cookies) {
       const [name, value] = cookie.trim().split('=');
-      if (name === 'session_id') {
+      if (name === 'session_id' && value) {
         const sessionExists = await JTB.get(`session:${value}`);
         return sessionExists === 'true';
       }
@@ -166,6 +247,13 @@ function generateUUID() {
     return v.toString(16);
   });
 }
+
+
+/*
+ * ============================================================================
+ * 前端资源部分
+ * ============================================================================
+ */
 
 const manifestContent = `{
   "name": "在线剪贴板",
@@ -227,8 +315,10 @@ const loginPage = `
           method: 'POST',
           body: formData
         });
-        if (response.ok) {
-          window.location.href = '/';
+        if (response.redirected) { // 检查是否发生重定向
+          window.location.href = response.url;
+        } else if (response.ok) {
+           window.location.href = '/';
         } else {
           const error = await response.text();
           errorMessage.textContent = error;
@@ -259,147 +349,47 @@ const htmlTemplate = `
   <style>
     body {
       font-family: 'Helvetica Neue', 'Arial', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
+      margin: 0; padding: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh;
       background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
       transition: background-color 0.5s ease;
     }
-    body.dark-mode {
-      background: linear-gradient(135deg, #333 0%, #222 100%);
-    }
-    h1 {
-      color: #2980b9;
-      margin-bottom: 20px;
-      font-size: 2.5em;
-      font-weight: 600;
-      opacity: 0;
-      animation: fadeIn 1s ease-in-out forwards;
-    }
-    .dark-mode h1 {
-      color: #74a7d2;
-    }
+    body.dark-mode { background: linear-gradient(135deg, #333 0%, #222 100%); }
+    h1 { color: #2980b9; margin-bottom: 20px; font-size: 2.5em; font-weight: 600; opacity: 0; animation: fadeIn 1s ease-in-out forwards; }
+    .dark-mode h1 { color: #74a7d2; }
+    @keyframes fadeIn { 0% { opacity: 0; transform: translateY(-20px); } 100% { opacity: 1; transform: translateY(0); } }
     .container {
-      background-color: rgba(255, 255, 255, 0.85);
-      border-radius: 15px;
-      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
-      padding: 40px;
-      width: 80%;
-      max-width: 500px;
-      transition: background-color 0.5s ease;
+      background-color: rgba(255, 255, 255, 0.85); border-radius: 15px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+      padding: 40px; width: 80%; max-width: 500px; transition: background-color 0.5s ease;
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4' viewBox='0 0 4 4'%3E%3Cpath fill='%239C92AC' fill-opacity='0.1' d='M1 3h1v1H1V3zm2-2h1v1H3V1z'%3E%3C/path%3E%3C/svg%3E");
     }
     .dark-mode .container {
-      background-color: rgba(51, 51, 51, 0.85);
-      box-shadow: 0 4px 10px rgba(255, 255, 255, 0.1);
+      background-color: rgba(51, 51, 51, 0.85); box-shadow: 0 4px 10px rgba(255, 255, 255, 0.1);
       background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4' viewBox='0 0 4 4'%3E%3Cpath fill='%23CCCCCC' fill-opacity='0.1' d='M1 3h1v1H1V3zm2-2h1v1H3V1z'%3E%3C/path%3E%3C/svg%3E");
     }
     textarea {
-      width: calc(100% - 30px);
-      height: 250px;
-      margin-bottom: 20px;
-      padding: 15px;
-      border: none;
-      border-radius: 10px;
-      font-size: 18px;
-      resize: vertical;
-      color: #333;
-      box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1);
-      background-color: #fff;
-      overflow: auto;
+      width: calc(100% - 30px); height: 250px; margin-bottom: 20px; padding: 15px; border: none; border-radius: 10px; font-size: 18px;
+      resize: vertical; color: #333; box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.1); background-color: #fff; overflow: auto;
       transition: box-shadow 0.3s ease;
     }
-    .dark-mode textarea {
-      color: #eee;
-      box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.1);
-      background-color: #444;
-    }
-    textarea:focus {
-      outline: none;
-      box-shadow: 0 0 5px 2px #2980b9;
-    }
-    .dark-mode textarea:focus {
-      box-shadow: 0 0 5px 2px #74a7d2;
-    }
+    .dark-mode textarea { color: #eee; box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.1); background-color: #444; }
+    textarea:focus { outline: none; box-shadow: 0 0 5px 2px #2980b9; }
+    .dark-mode textarea:focus { box-shadow: 0 0 5px 2px #74a7d2; }
     button {
-      background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
-      color: white;
-      border: 1px solid #2980b9;
-      padding: 15px 30px;
-      margin: 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 18px;
-      transition: all 0.2s ease-in-out;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); color: white; border: 1px solid #2980b9; padding: 15px 30px;
+      margin: 5px; border-radius: 8px; cursor: pointer; font-size: 18px; transition: all 0.2s ease-in-out; display: flex;
+      align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
     }
-    button:hover {
-      background: linear-gradient(135deg, #2980b9 0%, #3498db 100%);
-      transform: scale(1.05);
-    }
-    button:active {
-      transform: scale(0.95);
-      box-shadow: none;
-    }
-    button i {
-      margin-right: 10px;
-      font-size: 20px;
-    }
-    .button-group {
-      display: flex;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
-    @media (max-width: 768px) {
-      .container { padding: 20px; }
-      textarea { height: 200px; font-size: 16px; }
-      button { padding: 12px 25px; font-size: 16px; }
-      h1 { font-size: 2em; }
-    }
-    ::-webkit-scrollbar { width: 10px; }
-    ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
-    ::-webkit-scrollbar-thumb { background: #888; border-radius: 10px; }
-    ::-webkit-scrollbar-thumb:hover { background: #555; }
-    .dark-mode ::-webkit-scrollbar-track { background: #333; }
-    .dark-mode ::-webkit-scrollbar-thumb { background: #666; }
-    .dark-mode ::-webkit-scrollbar-thumb:hover { background: #999; }
-    .loading { position: relative; }
-    .loading::after {
-      content: '';
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
-      border: 4px solid #fff;
-      border-color: #fff transparent #fff transparent;
-      animation: loading 1.2s linear infinite;
-    }
-    @keyframes loading {
-      0% { transform: translate(-50%, -50%) rotate(0deg); }
-      100% { transform: translate(-50%, -50%) rotate(360deg); }
-    }
-    .dark-mode .loading::after { border-color: #eee transparent #eee transparent; }
-    @keyframes fadeIn {
-      0% { opacity: 0; transform: translateY(-20px); }
-      100% { opacity: 1; transform: translateY(0); }
-    }
+    button:hover { background: linear-gradient(135deg, #2980b9 0%, #3498db 100%); transform: scale(1.05); }
+    button:active { transform: scale(0.95); box-shadow: none; }
+    button i { margin-right: 10px; font-size: 20px; }
+    .button-group { display: flex; justify-content: center; flex-wrap: wrap; }
     .modal {
-      display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%;
-      overflow: auto; background-color: rgba(0, 0, 0, 0.4);
+        display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%;
+        overflow: auto; background-color: rgba(0, 0, 0, 0.5); animation: fadeIn 0.3s;
     }
     .modal-content {
-      background-color: #fefefe; margin: 15% auto; padding: 20px; border: 1px solid #888;
-      width: 80%; max-width: 400px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+        background-color: #fefefe; margin: 10% auto; padding: 20px; border: 1px solid #888;
+        width: 90%; max-width: 700px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
     }
     .dark-mode .modal-content { background-color: #444; color: #eee; border: 1px solid #666; }
     .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; }
@@ -407,17 +397,40 @@ const htmlTemplate = `
     .dark-mode .close:hover, .dark-mode .close:focus { color: white; }
     .modal-content label { display: block; margin-bottom: 5px; }
     .modal-content input, .modal-content button {
-      width: calc(100% - 20px); padding: 10px; margin-bottom: 10px; border-radius: 5px; border: 1px solid #ccc;
+        width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border-radius: 5px; border: 1px solid #ccc;
     }
     .dark-mode .modal-content input { background-color: #333; color: #fff; border: 1px solid #666; }
     .modal-content button {
-      width: 100%; background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
-      color: white; border: none; cursor: pointer;
+        width: 100%; background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+        color: white; border: none; cursor: pointer;
     }
-    .modal-content button:hover { background: linear-gradient(135deg, #2980b9 0%, #3498db 100%); }
     #shareLink { margin-top: 10px; word-break: break-all; }
     #logoutBtn { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); border-color: #c0392b; }
     #logoutBtn:hover { background: linear-gradient(135deg, #c0392b 0%, #e74c3c 100%); }
+    #manageSharesBtn { background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%); border-color: #27ae60; }
+    #manageSharesBtn:hover { background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%); }
+    
+    #shareListContainer { max-height: 400px; overflow-y: auto; margin-top: 20px; }
+    .share-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .share-table th, .share-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    .dark-mode .share-table th, .dark-mode .share-table td { border: 1px solid #666; }
+    .share-table th { background-color: #f2f2f2; font-weight: bold; }
+    .dark-mode .share-table th { background-color: #555; }
+    .share-table .action-btn { font-size: 12px; padding: 5px 10px; margin: 0 2px; border-radius: 4px; }
+    .share-table .edit-btn { background: #f39c12; border: none; }
+    .share-table .delete-btn { background: #e74c3c; border: none; }
+    .share-table a { color: #3498db; text-decoration: none; }
+    .dark-mode .share-table a { color: #5dade2; }
+    .share-table a:hover { text-decoration: underline; }
+
+    @media (max-width: 768px) {
+        .container { padding: 20px; }
+        textarea { height: 200px; font-size: 16px; }
+        button { padding: 12px 25px; font-size: 16px; width: calc(50% - 10px); }
+        h1 { font-size: 2em; }
+        .modal-content { width: 95%; margin: 5% auto; }
+        .share-table { font-size: 12px; }
+    }
   </style>
 </head>
 <body>
@@ -425,13 +438,15 @@ const htmlTemplate = `
     <h1>在线剪贴板</h1>
     <textarea id="clipboard" placeholder="在此处粘贴内容..."></textarea>
     <div class="button-group">
-      <button id="saveBtn"><i class="fas fa-cloud-upload-alt"></i>保存到云端</button>
-      <button id="readBtn"><i class="fas fa-cloud-download-alt"></i>从云端读取</button>
-      <button id="copyBtn"><i class="fas fa-copy"></i>复制到本地</button>
+      <button id="saveBtn"><i class="fas fa-cloud-upload-alt"></i>保存</button>
+      <button id="readBtn"><i class="fas fa-cloud-download-alt"></i>读取</button>
+      <button id="copyBtn"><i class="fas fa-copy"></i>复制</button>
       <button id="shareBtn"><i class="fas fa-share-alt"></i>分享</button>
+      <button id="manageSharesBtn"><i class="fas fa-list-check"></i>管理分享</button>
       <button id="logoutBtn"><i class="fas fa-sign-out-alt"></i>登出</button>
     </div>
   </div>
+
   <div id="shareModal" class="modal">
     <div class="modal-content">
       <span class="close">&times;</span>
@@ -444,7 +459,17 @@ const htmlTemplate = `
       <div id="shareLink"></div>
     </div>
   </div>
+
+  <div id="manageModal" class="modal">
+    <div class="modal-content">
+        <span class="close">&times;</span>
+        <h2>管理分享链接</h2>
+        <div id="shareListContainer"></div>
+    </div>
+  </div>
+
   <script>
+    // --- DOM元素获取 ---
     const clipboardTextarea = document.getElementById('clipboard');
     const saveBtn = document.getElementById('saveBtn');
     const readBtn = document.getElementById('readBtn');
@@ -452,10 +477,23 @@ const htmlTemplate = `
     const shareBtn = document.getElementById('shareBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const shareModal = document.getElementById('shareModal');
-    const closeModalBtn = document.querySelector('.close');
     const generateShareLinkBtn = document.getElementById('generateShareLink');
     const shareLinkDiv = document.getElementById('shareLink');
+    const manageSharesBtn = document.getElementById('manageSharesBtn');
+    const manageModal = document.getElementById('manageModal');
+    const shareListContainer = document.getElementById('shareListContainer');
+    
+    // --- 统一模态框处理 ---
+    document.querySelectorAll('.modal .close').forEach(btn => {
+        btn.onclick = () => btn.closest('.modal').style.display = 'none';
+    });
+    window.onclick = (event) => {
+        if (event.target.classList.contains('modal')) {
+            event.target.style.display = "none";
+        }
+    }
 
+    // --- 暗黑模式检测 ---
     function checkDarkMode() {
       if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
         document.body.classList.add('dark-mode');
@@ -465,81 +503,140 @@ const htmlTemplate = `
     }
     checkDarkMode();
     window.matchMedia('(prefers-color-scheme: dark)').addListener(checkDarkMode);
-
+    
+    // --- 核心按钮事件监听 ---
     saveBtn.addEventListener('click', async () => {
       const content = clipboardTextarea.value;
-      if (content) {
-        saveBtn.classList.add('loading');
-        const response = await fetch('/save', { method: 'POST', body: content });
-        saveBtn.classList.remove('loading');
-        if (response.ok) {
-          alert('已保存到云端！');
-        } else {
-          alert('保存失败！');
-        }
-      } else {
-        alert('剪贴板为空！');
-      }
+      if (!content) return alert('剪贴板为空！');
+      await fetch('/save', { method: 'POST', body: content }).then(res => {
+        if (res.ok) alert('已保存到云端！'); else alert('保存失败！');
+      });
     });
 
     readBtn.addEventListener('click', async () => {
-      readBtn.classList.add('loading');
       const response = await fetch('/read');
-      readBtn.classList.remove('loading');
-      if (response.ok) {
-        const content = await response.text();
-        clipboardTextarea.value = content;
-      } else {
-        alert('读取失败或剪贴板为空！');
-      }
+      if (response.ok) clipboardTextarea.value = await response.text();
+      else alert('读取失败或剪贴板为空！');
     });
 
     copyBtn.addEventListener('click', () => {
+      if (!clipboardTextarea.value) return alert('内容为空！');
       clipboardTextarea.select();
       document.execCommand('copy');
       alert('已复制到本地剪贴板！');
     });
 
-    shareBtn.addEventListener('click', () => {
-      shareModal.style.display = 'block';
-    });
+    logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
     
-    logoutBtn.addEventListener('click', () => {
-        window.location.href = '/logout';
-    });
-
-    closeModalBtn.addEventListener('click', () => {
-      shareModal.style.display = 'none';
+    shareBtn.addEventListener('click', () => {
+        document.getElementById('maxViews').value = '';
+        document.getElementById('validMinutes').value = '';
+        shareLinkDiv.innerHTML = '';
+        shareModal.style.display = 'block';
     });
 
     generateShareLinkBtn.addEventListener('click', async () => {
       const maxViews = document.getElementById('maxViews').value;
       const validMinutes = document.getElementById('validMinutes').value;
-
       const response = await fetch('/share', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           maxViews: maxViews ? parseInt(maxViews) : null,
           validMinutes: validMinutes ? parseInt(validMinutes) : null
         })
       });
-
       if (response.ok) {
         const { shareUrl } = await response.json();
         shareLinkDiv.innerHTML = \`分享链接: <a href="\${shareUrl}" target="_blank">\${shareUrl}</a>\`;
-      } else {
-        alert('生成分享链接失败！');
-      }
+      } else { alert('生成分享链接失败！剪贴板可能为空。'); }
     });
 
-    window.onclick = function(event) {
-      if (event.target == shareModal) {
-        shareModal.style.display = "none";
-      }
+    // --- 新增：管理分享功能 ---
+    manageSharesBtn.addEventListener('click', () => {
+        manageModal.style.display = 'block';
+        loadShareList();
+    });
+
+    function formatTimestamp(timestamp) {
+        if (!timestamp) return '永久';
+        const date = new Date(timestamp);
+        if (date < new Date()) return '<strong>已过期</strong>';
+        return date.toLocaleString('zh-CN', { hour12: false });
     }
+
+    async function loadShareList() {
+        shareListContainer.innerHTML = '<p>加载中...</p>';
+        const response = await fetch('/api/shares');
+        if (!response.ok) {
+            shareListContainer.innerHTML = '<p>加载失败，请重试。</p>';
+            return;
+        }
+        const shares = await response.json();
+        if (shares.length === 0) {
+            shareListContainer.innerHTML = '<p>暂无分享链接。</p>';
+            return;
+        }
+
+        const tableHTML = \`
+            <table class="share-table">
+                <thead>
+                    <tr>
+                        <th>链接</th>
+                        <th>已查看/最大</th>
+                        <th>过期时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                \${shares.map(share => \`
+                    <tr data-id="\${share.id}">
+                        <td><a href="\${share.url}" target="_blank">.../\${share.id.substr(-12)}</a></td>
+                        <td>\${share.views} / \${share.maxViews || '∞'}</td>
+                        <td>\${formatTimestamp(share.expireAt)}</td>
+                        <td>
+                            <button class="action-btn edit-btn" data-id="\${share.id}">编辑</button>
+                            <button class="action-btn delete-btn" data-id="\${share.id}">删除</button>
+                        </td>
+                    </tr>
+                \`).join('')}
+                </tbody>
+            </table>
+        \`;
+        shareListContainer.innerHTML = tableHTML;
+    }
+
+    shareListContainer.addEventListener('click', async (e) => {
+        const target = e.target.closest('.action-btn');
+        if (!target) return;
+        
+        const shareId = target.dataset.id;
+
+        if (target.classList.contains('delete-btn')) {
+            if (confirm('确定要删除这个分享链接吗？此操作不可恢复。')) {
+                const res = await fetch(\`/api/shares/\${shareId}\`, { method: 'DELETE' });
+                if(res.ok) { loadShareList(); } else { alert('删除失败！'); }
+            }
+        }
+
+        if (target.classList.contains('edit-btn')) {
+            const newMaxViews = prompt("请输入新的最大查看次数 (留空或输入0表示无限制):", "");
+            if (newMaxViews === null) return; // 用户取消
+
+            const newValidMinutes = prompt("请输入新的有效时间 (分钟，从现在开始计算，留空表示永久):", "");
+            if (newValidMinutes === null) return; // 用户取消
+            
+            const res = await fetch(\`/api/shares/\${shareId}\`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    maxViews: newMaxViews || null,
+                    validMinutes: newValidMinutes || null
+                })
+            });
+
+            if(res.ok) { loadShareList(); } else { alert('更新失败！'); }
+        }
+    });
   </script>
 </body>
 </html>
