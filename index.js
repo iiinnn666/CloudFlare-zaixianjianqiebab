@@ -9,7 +9,10 @@
  * - 支持创建、管理、修改、删除带权限（查看次数、有效期）的分享链接
  *
  * Version:  2.0
+ * Created:  2025-06-27
  * Revision:  2025-06-27 (新增分享管理功能)
+ * Revision:  2025-06-28 (修改分享链接过期或达上限后不自动删除)
+ * Revision:  2025-06-28 (修改分享时间或次数后覆盖原本设置，包括重置已查看次数)
  *
  * =====================================================================================
  */
@@ -17,7 +20,7 @@
 
 // 部署前，请确保已经在 Cloudflare Worker 的设置中完成了两件事：
 // 1. 绑定了一个 KV Namespace，并将其命名为 `JTB`。
-// 2. 在环境变量 (Environment Variables) 中设置了 `USER` 和 `PASSWORD` 用于登录。
+// 2. 在环境变量 (Environment Variables) 中设置了 `PASSWORD` 用于登录。
 
 
 addEventListener('fetch', event => {
@@ -43,17 +46,17 @@ async function handleRequest(request) {
 
     const { content, maxViews, expireAt, views } = JSON.parse(data);
 
+    // Check for expiration
     if (expireAt && Date.now() > expireAt) {
-      await JTB.delete(shareId); // 过期则删除
       return new Response('分享链接已过期', { status: 403 });
     }
 
+    // Check for max views
     if (maxViews && views >= maxViews) {
-      await JTB.delete(shareId); // 达到最大查看次数则删除
       return new Response('分享链接已达到最大查看次数', { status: 403 });
     }
 
-    // 只有在设置了最大查看次数时，才更新计数
+    // If neither expired nor max views reached, increment view count if maxViews is set
     if (maxViews) {
       await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: views + 1 }));
     }
@@ -65,11 +68,10 @@ async function handleRequest(request) {
   if (path === '/login') {
     if (request.method === 'POST') {
       const formData = await request.formData();
-      const username = formData.get('username');
       const password = formData.get('password');
 
-      // 与Cloudflare环境变量进行比对
-      if (username === USER && password === PASSWORD) {
+      // 仅与Cloudflare环境变量中的PASSWORD进行比对
+      if (password === PASSWORD) {
         const sessionId = generateUUID();
         await JTB.put(`session:${sessionId}`, 'true', { expirationTtl: 86400 }); // Session有效期24小时
 
@@ -82,7 +84,7 @@ async function handleRequest(request) {
           headers,
         });
       } else {
-        return new Response('用户名或密码错误', { status: 401 });
+        return new Response('密码错误', { status: 401 });
       }
     }
     // GET请求则显示登录页面
@@ -153,15 +155,16 @@ async function handleRequest(request) {
     const shareId = generateUUID();
     const expireAt = validMinutes ? Date.now() + validMinutes * 60 * 1000 : null;
 
-    // expirationTtl的单位是秒
+    // expirationTtl的单位是秒。
+    // 如果validMinutes为null或0，则expirationTtl为undefined，KV将永久保存此键，除非手动删除。
     const expirationTtl = validMinutes ? validMinutes * 60 : undefined;
 
     await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: 0 }), { expirationTtl });
 
     const shareUrl = `${url.origin}/s/${shareId}`;
     return new Response(JSON.stringify({ shareUrl }), { headers: { 'Content-Type': 'application/json' }});
-  } 
-  
+  }
+
   // --- 新增的管理分享链接的API ---
   else if (path === '/api/shares' && request.method === 'GET') {
     const list = await JTB.list();
@@ -187,12 +190,12 @@ async function handleRequest(request) {
     // 按创建时间排序（假设时间戳在expireAt中，越大的越新）
     shares.sort((a, b) => (b.expireAt || Infinity) - (a.expireAt || Infinity));
     return new Response(JSON.stringify(shares), { headers: { 'Content-Type': 'application/json' } });
-  } 
+  }
   else if (path.startsWith('/api/shares/') && request.method === 'DELETE') {
     const shareId = path.substring('/api/shares/'.length);
     await JTB.delete(shareId);
     return new Response('删除成功', { status: 200 });
-  } 
+  }
   else if (path.startsWith('/api/shares/') && request.method === 'PUT') {
     const shareId = path.substring('/api/shares/'.length);
     const existingData = await JTB.get(shareId);
@@ -204,10 +207,26 @@ async function handleRequest(request) {
     const updates = await request.json();
     const data = JSON.parse(existingData);
 
-    // 更新数据
-    data.maxViews = updates.maxViews ? parseInt(updates.maxViews) : null;
-    data.expireAt = updates.validMinutes ? Date.now() + parseInt(updates.validMinutes) * 60 * 1000 : null;
-    const expirationTtl = updates.validMinutes ? parseInt(updates.validMinutes) * 60 : undefined;
+    // 存储旧的 maxViews 值，用于判断是否发生变化
+    const oldMaxViews = data.maxViews;
+
+    // 显式设置 maxViews 为 null 如果输入为空或 0
+    data.maxViews = updates.maxViews !== null && updates.maxViews !== '' && parseInt(updates.maxViews) > 0
+                     ? parseInt(updates.maxViews) : null;
+
+    // 如果 maxViews 限制已更改，则重置当前的已查看次数
+    if (oldMaxViews !== data.maxViews) {
+        data.views = 0;
+    }
+
+    // 显式设置 expireAt 为 null 如果输入为空或 0
+    const newValidMinutes = updates.validMinutes !== null && updates.validMinutes !== '' && parseInt(updates.validMinutes) > 0
+                            ? parseInt(updates.validMinutes) : null;
+    data.expireAt = newValidMinutes ? Date.now() + newValidMinutes * 60 * 1000 : null;
+
+    // 更新 KV 的内部 expirationTtl。
+    const expirationTtl = newValidMinutes ? newValidMinutes * 60 : undefined;
+
 
     await JTB.put(shareId, JSON.stringify(data), { expirationTtl });
     return new Response('更新成功', { status: 200 });
@@ -221,7 +240,7 @@ async function handleRequest(request) {
 /**
  * 检查Cookie中是否存在有效的session
  * @param {Request} request
- */
+*/
 async function isAuthenticated(request) {
   const cookieHeader = request.headers.get('Cookie');
   if (cookieHeader) {
@@ -297,7 +316,6 @@ const loginPage = `
   <div class="login-container">
     <h1>登录</h1>
     <form>
-      <input type="text" id="username" name="username" placeholder="用户" required>
       <input type="password" id="password" name="password" placeholder="密码" required>
       <button type="submit">登录</button>
     </form>
@@ -408,7 +426,7 @@ const htmlTemplate = `
     #logoutBtn:hover { background: linear-gradient(135deg, #c0392b 0%, #e74c3c 100%); }
     #manageSharesBtn { background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%); border-color: #27ae60; }
     #manageSharesBtn:hover { background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%); }
-    
+
     #shareListContainer { max-height: 400px; overflow-y: auto; margin-top: 20px; }
     .share-table { width: 100%; border-collapse: collapse; font-size: 14px; }
     .share-table th, .share-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
@@ -481,7 +499,7 @@ const htmlTemplate = `
     const manageSharesBtn = document.getElementById('manageSharesBtn');
     const manageModal = document.getElementById('manageModal');
     const shareListContainer = document.getElementById('shareListContainer');
-    
+
     // --- 统一模态框处理 ---
     document.querySelectorAll('.modal .close').forEach(btn => {
         btn.onclick = () => btn.closest('.modal').style.display = 'none';
@@ -502,7 +520,7 @@ const htmlTemplate = `
     }
     checkDarkMode();
     window.matchMedia('(prefers-color-scheme: dark)').addListener(checkDarkMode);
-    
+
     // --- 核心按钮事件监听 ---
     saveBtn.addEventListener('click', async () => {
       const content = clipboardTextarea.value;
@@ -526,7 +544,7 @@ const htmlTemplate = `
     });
 
     logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
-    
+
     shareBtn.addEventListener('click', () => {
         document.getElementById('maxViews').value = '';
         document.getElementById('validMinutes').value = '';
@@ -559,6 +577,7 @@ const htmlTemplate = `
     function formatTimestamp(timestamp) {
         if (!timestamp) return '永久';
         const date = new Date(timestamp);
+        // Check if the link has actually expired
         if (date < new Date()) return '<strong>已过期</strong>';
         return date.toLocaleString('zh-CN', { hour12: false });
     }
@@ -607,7 +626,7 @@ const htmlTemplate = `
     shareListContainer.addEventListener('click', async (e) => {
         const target = e.target.closest('.action-btn');
         if (!target) return;
-        
+
         const shareId = target.dataset.id;
 
         if (target.classList.contains('delete-btn')) {
@@ -618,18 +637,36 @@ const htmlTemplate = `
         }
 
         if (target.classList.contains('edit-btn')) {
-            const newMaxViews = prompt("请输入新的最大查看次数 (留空或输入0表示无限制):", "");
+            // Retrieve current values for pre-filling prompts, making editing more user-friendly
+            const row = target.closest('tr');
+            const currentMaxViewsText = row.children[1].textContent.split(' / ')[1];
+            const currentMaxViews = currentMaxViewsText === '∞' ? '' : parseInt(currentMaxViewsText);
+
+            const currentExpireAtText = row.children[2].textContent;
+            let currentValidMinutes = '';
+            if (currentExpireAtText !== '永久' && currentExpireAtText !== '<strong>已过期</strong>') {
+                const now = new Date();
+                const expireDate = new Date(currentExpireAtText);
+                const diffMinutes = Math.ceil((expireDate.getTime() - now.getTime()) / (1000 * 60));
+                if (diffMinutes > 0) {
+                    currentValidMinutes = diffMinutes;
+                }
+            }
+
+
+            const newMaxViews = prompt("请输入新的最大查看次数 (留空或输入0表示无限制):", currentMaxViews);
             if (newMaxViews === null) return; // 用户取消
 
-            const newValidMinutes = prompt("请输入新的有效时间 (分钟，从现在开始计算，留空表示永久):", "");
+            const newValidMinutes = prompt("请输入新的有效时间 (分钟，从现在开始计算，留空表示永久):", currentValidMinutes);
             if (newValidMinutes === null) return; // 用户取消
-            
+
             const res = await fetch(\`/api/shares/\${shareId}\`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    maxViews: newMaxViews || null,
-                    validMinutes: newValidMinutes || null
+                    // Send null if empty string or "0" to ensure overwrite to "no limit"
+                    maxViews: newMaxViews === '' || parseInt(newMaxViews) === 0 ? null : parseInt(newMaxViews),
+                    validMinutes: newValidMinutes === '' || parseInt(newValidMinutes) === 0 ? null : parseInt(newValidMinutes)
                 })
             });
 
@@ -640,3 +677,4 @@ const htmlTemplate = `
 </body>
 </html>
 `;
+
