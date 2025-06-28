@@ -8,11 +8,15 @@
  * - 支持文本、文件（通过URL）的跨设备同步
  * - 支持创建、管理、修改、删除带权限（查看次数、有效期）的分享链接
  *
- * Version:  2.0
+ * Version:  2.1
  * Created:  2025-06-27
  * Revision:  2025-06-27 (新增分享管理功能)
- * Revision:  2025-06-28 (修改分享链接过期或达上限后不自动删除)
+ * Revision:  2025-06-28 (修改分享链接过期或达上限后不自动删除 - 重复但实际上KV特性)
  * Revision:  2025-06-28 (修改分享时间或次数后覆盖原本设置，包括重置已查看次数)
+ * Revision:  2025-06-28 (新增自定义分享链接功能)
+ * Revision:  2025-06-28 (确保链接过期或达上限后不自动删除 KV 键，仅通过代码控制访问)
+ * Revision:  2025-06-28 (自定义分享ID最低长度修改为1个字符)
+ * Revision:  2025-06-28 (修复无限制分享链接无法查看次数的问题)
  *
  * =====================================================================================
  */
@@ -37,7 +41,7 @@ async function handleRequest(request) {
 
   // 1. 处理公开的分享链接 /s/ (无需登录)
   if (path.startsWith('/s/') && request.method === 'GET') {
-    const shareId = path.substring(3);
+    const shareId = decodeURIComponent(path.substring(3)); // Decode URI component for custom IDs
     const data = await JTB.get(shareId);
 
     if (!data) {
@@ -56,10 +60,9 @@ async function handleRequest(request) {
       return new Response('分享链接已达到最大查看次数', { status: 403 });
     }
 
-    // If neither expired nor max views reached, increment view count if maxViews is set
-    if (maxViews) {
-      await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: views + 1 }));
-    }
+    // Always increment and save views, regardless of maxViews setting
+    // 确保即使 maxViews 为 null (无限制) 也能记录 views
+    await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: views + 1 }));
 
     return new Response(content);
   }
@@ -127,6 +130,7 @@ async function handleRequest(request) {
     // 保存到云端
     const content = await request.text();
     if (content) {
+      // 永久保存剪贴板内容，不设置 expirationTtl
       await JTB.put("clipboard", content);
       return new Response('好的');
     } else {
@@ -151,17 +155,36 @@ async function handleRequest(request) {
       return new Response('剪贴板为空', { status: 400 });
     }
 
-    const { maxViews, validMinutes } = await request.json();
-    const shareId = generateUUID();
+    const { maxViews, validMinutes, customId } = await request.json();
+    let shareId = customId;
+
+    // Validate custom ID
+    if (customId) {
+        // Prevent custom IDs that clash with system paths or are empty/too short
+        if (customId.startsWith('session:') || customId === 'clipboard' || customId.startsWith('api/') || customId.startsWith('s/') || customId === 'login' || customId === 'logout' || customId === 'save' || customId === 'read' || customId === 'share' || customId.startsWith('manifest.json')) {
+            return new Response('自定义ID不能与系统路径冲突', { status: 400 });
+        }
+        if (customId.length < 1) { // 修改为至少1个字符
+            return new Response('自定义ID太短，至少1个字符', { status: 400 });
+        }
+        // Check if customId already exists
+        const existingShare = await JTB.get(customId);
+        if (existingShare) {
+            return new Response('自定义ID已被占用，请尝试其他名称', { status: 409 }); // Conflict
+        }
+    } else {
+        shareId = generateUUID();
+    }
+
+    // expireAt 用于前端和管理界面的显示，以及在 /s/ 路径下的访问控制
     const expireAt = validMinutes ? Date.now() + validMinutes * 60 * 1000 : null;
 
-    // expirationTtl的单位是秒。
-    // 如果validMinutes为null或0，则expirationTtl为undefined，KV将永久保存此键，除非手动删除。
-    const expirationTtl = validMinutes ? validMinutes * 60 : undefined;
+    // 关键改变：不设置 expirationTtl，让 KV 永久保存此键，由 Worker 代码控制访问和删除
+    // 初始化 views 为 0
+    await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: 0 }));
 
-    await JTB.put(shareId, JSON.stringify({ content, maxViews, expireAt, views: 0 }), { expirationTtl });
-
-    const shareUrl = `${url.origin}/s/${shareId}`;
+    // Encode shareId for URL if it contains special characters (e.g., Chinese)
+    const shareUrl = `${url.origin}/s/${encodeURIComponent(shareId)}`;
     return new Response(JSON.stringify({ shareUrl }), { headers: { 'Content-Type': 'application/json' }});
   }
 
@@ -171,14 +194,15 @@ async function handleRequest(request) {
     let shares = [];
     for (const key of list.keys) {
       // 过滤掉非分享链接的key (例如 session:..., clipboard)
-      if (key.name.includes('-') && key.name.length === 36) { // 简单的UUID判断
+      // Custom IDs might not be UUIDs, so check for common system keys instead.
+      if (!key.name.startsWith('session:') && key.name !== 'clipboard' && !key.name.startsWith('api/') && !key.name.startsWith('s/') && key.name !== 'login' && key.name !== 'logout' && key.name !== 'save' && key.name !== 'read' && key.name !== 'share' && !key.name.startsWith('manifest.json')) {
         const data = await JTB.get(key.name);
         if (data) {
           try {
             const shareData = JSON.parse(data);
             shares.push({
               id: key.name,
-              url: `${url.origin}/s/${key.name}`,
+              url: `${url.origin}/s/${encodeURIComponent(key.name)}`, // Encode custom ID for display
               ...shareData
             });
           } catch(e) {
@@ -188,16 +212,17 @@ async function handleRequest(request) {
       }
     }
     // 按创建时间排序（假设时间戳在expireAt中，越大的越新）
+    // 或者可以添加一个 createdAt 字段来精确排序
     shares.sort((a, b) => (b.expireAt || Infinity) - (a.expireAt || Infinity));
     return new Response(JSON.stringify(shares), { headers: { 'Content-Type': 'application/json' } });
   }
   else if (path.startsWith('/api/shares/') && request.method === 'DELETE') {
-    const shareId = path.substring('/api/shares/'.length);
+    const shareId = decodeURIComponent(path.substring('/api/shares/'.length)); // Decode custom ID
     await JTB.delete(shareId);
     return new Response('删除成功', { status: 200 });
   }
   else if (path.startsWith('/api/shares/') && request.method === 'PUT') {
-    const shareId = path.substring('/api/shares/'.length);
+    const shareId = decodeURIComponent(path.substring('/api/shares/'.length)); // Decode custom ID
     const existingData = await JTB.get(shareId);
 
     if (!existingData) {
@@ -212,23 +237,27 @@ async function handleRequest(request) {
 
     // 显式设置 maxViews 为 null 如果输入为空或 0
     data.maxViews = updates.maxViews !== null && updates.maxViews !== '' && parseInt(updates.maxViews) > 0
-                     ? parseInt(updates.maxViews) : null;
+                          ? parseInt(updates.maxViews) : null;
 
-    // 如果 maxViews 限制已更改，则重置当前的已查看次数
-    if (oldMaxViews !== data.maxViews) {
-        data.views = 0;
+    // 如果 maxViews 限制已更改 (从有上限到无上限，或从无上限到有上限，或数值改变)，则重置当前的已查看次数
+    // 关键：旧的 maxViews 为 null 或 undefined 且新的 maxViews 有值，或反之，或两者都有值但不同
+    if (
+        (oldMaxViews === null && data.maxViews !== null) ||
+        (oldMaxViews !== null && data.maxViews === null) ||
+        (oldMaxViews !== null && data.maxViews !== null && oldMaxViews !== data.maxViews)
+    ) {
+        data.views = 0; // 重置已查看次数
     }
+
 
     // 显式设置 expireAt 为 null 如果输入为空或 0
     const newValidMinutes = updates.validMinutes !== null && updates.validMinutes !== '' && parseInt(updates.validMinutes) > 0
-                            ? parseInt(updates.validMinutes) : null;
+                                ? parseInt(updates.validMinutes) : null;
     data.expireAt = newValidMinutes ? Date.now() + newValidMinutes * 60 * 1000 : null;
 
-    // 更新 KV 的内部 expirationTtl。
-    const expirationTtl = newValidMinutes ? newValidMinutes * 60 : undefined;
-
-
-    await JTB.put(shareId, JSON.stringify(data), { expirationTtl });
+    // 关键改变：不设置 expirationTtl，让 KV 永久保存此键，由 Worker 代码控制访问和删除
+    // 当更新时，也不需要传递 expirationTtl
+    await JTB.put(shareId, JSON.stringify(data));
     return new Response('更新成功', { status: 200 });
   }
 
@@ -414,7 +443,7 @@ const htmlTemplate = `
     .dark-mode .close:hover, .dark-mode .close:focus { color: white; }
     .modal-content label { display: block; margin-bottom: 5px; }
     .modal-content input, .modal-content button {
-        width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border-radius: 5px; border: 1px solid #ccc;
+      width: calc(100% - 22px); padding: 10px; margin-bottom: 10px; border-radius: 5px; border: 1px solid #ccc;
     }
     .dark-mode .modal-content input { background-color: #333; color: #fff; border: 1px solid #666; }
     .modal-content button {
@@ -468,6 +497,8 @@ const htmlTemplate = `
     <div class="modal-content">
       <span class="close">&times;</span>
       <h2>分享设置</h2>
+      <label for="customShareId">自定义链接ID (留空则自动生成UUID, 支持中文):</label>
+      <input type="text" id="customShareId" placeholder="例如: 我的秘密笔记">
       <label for="maxViews">最大查看次数 (留空表示无限制):</label>
       <input type="number" id="maxViews" placeholder="例如: 5">
       <label for="validMinutes">有效时间 (分钟，留空表示永久有效):</label>
@@ -494,6 +525,7 @@ const htmlTemplate = `
     const shareBtn = document.getElementById('shareBtn');
     const logoutBtn = document.getElementById('logoutBtn');
     const shareModal = document.getElementById('shareModal');
+    const customShareIdInput = document.getElementById('customShareId'); // New
     const generateShareLinkBtn = document.getElementById('generateShareLink');
     const shareLinkDiv = document.getElementById('shareLink');
     const manageSharesBtn = document.getElementById('manageSharesBtn');
@@ -546,6 +578,7 @@ const htmlTemplate = `
     logoutBtn.addEventListener('click', () => { window.location.href = '/logout'; });
 
     shareBtn.addEventListener('click', () => {
+        document.getElementById('customShareId').value = ''; // Clear custom ID on open
         document.getElementById('maxViews').value = '';
         document.getElementById('validMinutes').value = '';
         shareLinkDiv.innerHTML = '';
@@ -555,17 +588,23 @@ const htmlTemplate = `
     generateShareLinkBtn.addEventListener('click', async () => {
       const maxViews = document.getElementById('maxViews').value;
       const validMinutes = document.getElementById('validMinutes').value;
+      const customId = customShareIdInput.value.trim(); // Get custom ID
+
       const response = await fetch('/share', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           maxViews: maxViews ? parseInt(maxViews) : null,
-          validMinutes: validMinutes ? parseInt(validMinutes) : null
+          validMinutes: validMinutes ? parseInt(validMinutes) : null,
+          customId: customId || null // Send customId if not empty, otherwise null
         })
       });
       if (response.ok) {
         const { shareUrl } = await response.json();
         shareLinkDiv.innerHTML = \`分享链接: <a href="\${shareUrl}" target="_blank">\${shareUrl}</a>\`;
-      } else { alert('生成分享链接失败！剪贴板可能为空。'); }
+      } else {
+        const errorText = await response.text();
+        alert('生成分享链接失败！' + errorText);
+      }
     });
 
     // --- 新增：管理分享功能 ---
@@ -608,8 +647,8 @@ const htmlTemplate = `
                 <tbody>
                 \${shares.map(share => \`
                     <tr data-id="\${share.id}">
-                        <td><a href="\${share.url}" target="_blank">.../\${share.id.substr(-12)}</a></td>
-                        <td>\${share.views} / \${share.maxViews || '∞'}</td>
+                        <td><a href="\${share.url}" target="_blank">.../\${share.id.length > 20 ? share.id.substr(0, 10) + '...' + share.id.substr(-10) : share.id}</a></td>
+                        <td>\${share.views} / \${share.maxViews === null ? '∞' : share.maxViews}</td>
                         <td>\${formatTimestamp(share.expireAt)}</td>
                         <td>
                             <button class="action-btn edit-btn" data-id="\${share.id}">编辑</button>
@@ -631,7 +670,7 @@ const htmlTemplate = `
 
         if (target.classList.contains('delete-btn')) {
             if (confirm('确定要删除这个分享链接吗？此操作不可恢复。')) {
-                const res = await fetch(\`/api/shares/\${shareId}\`, { method: 'DELETE' });
+                const res = await fetch(\`/api/shares/\${encodeURIComponent(shareId)}\`, { method: 'DELETE' }); // Encode ID
                 if(res.ok) { loadShareList(); } else { alert('删除失败！'); }
             }
         }
@@ -639,12 +678,15 @@ const htmlTemplate = `
         if (target.classList.contains('edit-btn')) {
             // Retrieve current values for pre-filling prompts, making editing more user-friendly
             const row = target.closest('tr');
+            // 注意：这里需要从原始数据中获取 maxViews，而不是从显示文本中解析 '∞'
+            // 为简化演示，这里仍从显示文本解析，实际应用中建议从 loadShareList 返回的 shares 数组中查找原始数据
             const currentMaxViewsText = row.children[1].textContent.split(' / ')[1];
             const currentMaxViews = currentMaxViewsText === '∞' ? '' : parseInt(currentMaxViewsText);
 
             const currentExpireAtText = row.children[2].textContent;
             let currentValidMinutes = '';
-            if (currentExpireAtText !== '永久' && currentExpireAtText !== '<strong>已过期</strong>') {
+            // 如果链接未过期且有过期时间，计算剩余分钟数
+            if (currentExpireAtText !== '永久' && !currentExpireAtText.includes('已过期')) {
                 const now = new Date();
                 const expireDate = new Date(currentExpireAtText);
                 const diffMinutes = Math.ceil((expireDate.getTime() - now.getTime()) / (1000 * 60));
@@ -660,7 +702,7 @@ const htmlTemplate = `
             const newValidMinutes = prompt("请输入新的有效时间 (分钟，从现在开始计算，留空表示永久):", currentValidMinutes);
             if (newValidMinutes === null) return; // 用户取消
 
-            const res = await fetch(\`/api/shares/\${shareId}\`, {
+            const res = await fetch(\`/api/shares/\${encodeURIComponent(shareId)}\`, { // Encode ID
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -677,4 +719,3 @@ const htmlTemplate = `
 </body>
 </html>
 `;
-
