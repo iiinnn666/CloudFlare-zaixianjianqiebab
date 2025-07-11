@@ -10,8 +10,9 @@
  * - 支持创建带密码的私密分享
  * - 在管理界面支持点击图标查看分享密码
  * - 在管理界面支持按创建时间排序
+ * - 在管理界面支持按修改分享链接内容
  *
- * Version:  2.2
+ * Version:  2.3
  * Created:  2025-06-27
  * Revision:  2025-06-27 (新增分享管理功能)
  * Revision:  2025-06-28 (修改分享链接过期或达上限后不自动删除 - 重复但实际上KV特性)
@@ -23,6 +24,7 @@
  * Revision:  2025-06-29 (新增私密分享功能)
  * Revision:  2025-06-29 (新增点击图标查看密码功能)
  * Revision:  2025-06-29 (新增管理分享链接的新旧排序功能)
+ * Revision:  2025-07-11 (新增管理界面修改分享链接里的内容)
  *
  * =====================================================================================
  */
@@ -78,21 +80,20 @@ async function handleRequest(request) {
           return new Response(content);
         } else {
           // 密码错误，返回带错误提示的密码输入页面
-          const errorPage = privateSharePage.replace('', '<p style="color:red;">密码错误，请重试。</p>');
+          const errorPage = privateSharePage.replace('</div>', '<p style="color:red;">密码错误，请重试。</p></div>');
           return new Response(errorPage, { status: 401, headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
         }
       } else {
         // GET 请求，返回密码输入页面
-        const cleanPage = privateSharePage.replace('', '');
-        return new Response(cleanPage, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+        return new Response(privateSharePage, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
     }
     // --- 私密分享逻辑结束 ---
 
     // 对于公开链接 (GET请求)
     if (request.method === 'GET') {
-        await JTB.put(shareId, JSON.stringify({ ...shareData, views: views + 1 }));
-        return new Response(content);
+      await JTB.put(shareId, JSON.stringify({ ...shareData, views: views + 1 }));
+      return new Response(content);
     }
 
     return new Response('方法不允许', { status: 405 });
@@ -196,7 +197,6 @@ async function handleRequest(request) {
 
     const expireAt = validMinutes ? Date.now() + validMinutes * 60 * 1000 : null;
 
-    // 【修改】新增 createdAt 字段
     const shareData = {
         content,
         maxViews,
@@ -224,7 +224,6 @@ async function handleRequest(request) {
         if (data) {
           try {
             const shareData = JSON.parse(data);
-            // 【重要】现在将包含密码的完整数据发送到前端，以便实现点击查看功能
             shares.push({
               id: key.name,
               url: `${url.origin}/s/${encodeURIComponent(key.name)}`,
@@ -234,8 +233,6 @@ async function handleRequest(request) {
         }
       }
     }
-    // 【修改】移除后端的排序，交由前端处理
-    // shares.sort((a, b) => (b.expireAt || Infinity) - (a.expireAt || Infinity));
     return new Response(JSON.stringify(shares), { headers: { 'Content-Type': 'application/json' } });
   }
   else if (path.startsWith('/api/shares/') && request.method === 'DELETE') {
@@ -243,6 +240,7 @@ async function handleRequest(request) {
     await JTB.delete(shareId);
     return new Response('删除成功', { status: 200 });
   }
+  // 【修改】更新分享链接的API，增加更新内容的功能
   else if (path.startsWith('/api/shares/') && request.method === 'PUT') {
     const shareId = decodeURIComponent(path.substring('/api/shares/'.length));
     const existingData = await JTB.get(shareId);
@@ -253,25 +251,37 @@ async function handleRequest(request) {
 
     const updates = await request.json();
     const data = JSON.parse(existingData);
-    const oldMaxViews = data.maxViews;
 
-    data.maxViews = updates.maxViews !== null && updates.maxViews !== '' && parseInt(updates.maxViews) > 0
-                        ? parseInt(updates.maxViews) : null;
-
-    if (
-        (oldMaxViews === null && data.maxViews !== null) ||
-        (oldMaxViews !== null && data.maxViews === null) ||
-        (oldMaxViews !== null && data.maxViews !== null && oldMaxViews !== data.maxViews)
-    ) {
-        data.views = 0;
+    // 更新内容 (如果请求中提供了)
+    if (updates.content !== undefined) {
+        data.content = updates.content;
     }
 
-    const newValidMinutes = updates.validMinutes !== null && updates.validMinutes !== '' && parseInt(updates.validMinutes) > 0
-                                  ? parseInt(updates.validMinutes) : null;
-    data.expireAt = newValidMinutes ? Date.now() + newValidMinutes * 60 * 1000 : null;
-    
-    // 注意：createdAt 字段在更新时保持不变
+    // 更新最大浏览次数 (如果请求中提供了)
+    if (updates.maxViews !== undefined) {
+        const oldMaxViews = data.maxViews;
+        data.maxViews = updates.maxViews !== null && updates.maxViews !== '' && parseInt(updates.maxViews, 10) > 0
+            ? parseInt(updates.maxViews, 10)
+            : null;
 
+        const maxViewsChanged = (oldMaxViews === null && data.maxViews !== null) ||
+                              (oldMaxViews !== null && data.maxViews === null) ||
+                              (oldMaxViews !== null && data.maxViews !== null && oldMaxViews !== data.maxViews);
+
+        if (maxViewsChanged) {
+            data.views = 0; // 重置浏览次数
+        }
+    }
+
+    // 更新过期时间 (如果请求中提供了)
+    if (updates.validMinutes !== undefined) {
+        const newValidMinutes = updates.validMinutes !== null && updates.validMinutes !== '' && parseInt(updates.validMinutes, 10) > 0
+            ? parseInt(updates.validMinutes, 10)
+            : null;
+        data.expireAt = newValidMinutes ? Date.now() + newValidMinutes * 60 * 1000 : null;
+    }
+
+    // createdAt 字段在更新时保持不变
     await JTB.put(shareId, JSON.stringify(data));
     return new Response('更新成功', { status: 200 });
   }
@@ -419,7 +429,7 @@ const privateSharePage = `
       <input type="password" name="password" placeholder="分享密码" required autofocus>
       <button type="submit">确认</button>
       <div class="error-message">
-          </div>
+      </div>
     </form>
   </div>
 </body>
@@ -511,16 +521,16 @@ const htmlTemplate = `
     .dark-mode .share-table th, .dark-mode .share-table td { border: 1px solid #666; }
     .share-table th { background-color: #f2f2f2; font-weight: bold; }
     .dark-mode .share-table th { background-color: #555; }
-    .share-table .action-btn { font-size: 12px; padding: 5px 10px; margin: 0 2px; border-radius: 4px; }
-    .share-table .edit-btn { background: #f39c12; border: none; }
-    .share-table .delete-btn { background: #e74c3c; border: none; }
+    .share-table .action-btn { font-size: 12px; padding: 5px 10px; margin: 0 2px; border-radius: 4px; color: white; border: none; }
+    .share-table .edit-content-btn { background: #3498db; }
+    .share-table .edit-settings-btn { background: #f39c12; }
+    .share-table .delete-btn { background: #e74c3c; }
     .share-table a { color: #3498db; text-decoration: none; }
     .dark-mode .share-table a { color: #5dade2; }
     .share-table a:hover { text-decoration: underline; }
     .view-password-btn { margin-left: 8px; color: #777; cursor: pointer; }
     .dark-mode .view-password-btn { color: #aaa; }
     
-    /* 【新增】排序按钮样式 */
     .sort-controls { margin-bottom: 15px; text-align: right; }
     .sort-btn { 
       padding: 6px 12px; font-size: 14px; background: #f0f0f0; color: #333; 
@@ -588,6 +598,15 @@ const htmlTemplate = `
     </div>
   </div>
 
+  <div id="editContentModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>编辑分享内容</h2>
+      <textarea id="editContentTextarea" style="width: calc(100% - 30px); height: 300px; margin-top: 10px; padding: 15px; border: 1px solid #ccc; border-radius: 5px; font-size: 16px;"></textarea>
+      <button id="saveContentChangesBtn" style="margin-top: 15px;">保存更改</button>
+    </div>
+  </div>
+
   <script>
     // --- DOM元素获取 ---
     const clipboardTextarea = document.getElementById('clipboard');
@@ -605,7 +624,7 @@ const htmlTemplate = `
     const manageModal = document.getElementById('manageModal');
     const shareListContainer = document.getElementById('shareListContainer');
 
-    // 【新增】用于缓存分享列表数据
+    // 用于缓存分享列表数据
     let currentShares = [];
 
     // --- 统一模态框处理 ---
@@ -705,20 +724,18 @@ const htmlTemplate = `
         loadShareList();
     });
 
-    // 【新增】为排序按钮和管理弹窗内的其他点击添加事件委托
+    // 为排序按钮和管理弹窗内的其他点击添加事件委托
     manageModal.addEventListener('click', async (e) => {
         const target = e.target;
         if (!target) return;
         
         // --- 排序逻辑 ---
         if (target.id === 'sortNewToOld') {
-            // b - a 实现降序
             currentShares.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
             renderShareList(currentShares);
             return;
         }
         if (target.id === 'sortOldToNew') {
-            // a - b 实现升序
             currentShares.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
             renderShareList(currentShares);
             return;
@@ -736,6 +753,19 @@ const htmlTemplate = `
         if (!actionButton) return;
 
         const shareId = actionButton.dataset.id;
+        
+        // 【新增】处理“内容”按钮点击
+        if (actionButton.classList.contains('edit-content-btn')) {
+            const share = currentShares.find(s => s.id === shareId);
+            if (share) {
+                const editModal = document.getElementById('editContentModal');
+                const editTextarea = document.getElementById('editContentTextarea');
+                editTextarea.value = share.content;
+                editModal.dataset.editingShareId = shareId;
+                editModal.style.display = 'block';
+            }
+            return;
+        }
 
         if (actionButton.classList.contains('delete-btn')) {
             if (confirm('确定要删除这个分享链接吗？此操作不可恢复。')) {
@@ -744,11 +774,13 @@ const htmlTemplate = `
             }
         }
 
-        if (actionButton.classList.contains('edit-btn')) {
-            const row = actionButton.closest('tr');
-            const currentMaxViewsText = row.children[1].textContent.split(' / ')[1];
-            const currentMaxViews = currentMaxViewsText === '∞' ? '' : parseInt(currentMaxViewsText);
-            const newMaxViews = prompt("请输入新的最大查看次数 (留空或0表示无限制):", currentMaxViews);
+        // 【修改】处理“设置”按钮点击
+        if (actionButton.classList.contains('edit-settings-btn')) {
+            const currentShare = currentShares.find(s => s.id === shareId);
+            if (!currentShare) return;
+
+            const currentMaxViewsText = currentShare.maxViews === null ? '' : currentShare.maxViews;
+            const newMaxViews = prompt("请输入新的最大查看次数 (留空或0表示无限制):", currentMaxViewsText);
             if (newMaxViews === null) return;
 
             const newValidMinutes = prompt("请输入新的有效时间 (分钟，从现在开始计算，留空或0表示永久):", '');
@@ -767,6 +799,42 @@ const htmlTemplate = `
         }
     });
 
+    // 【新增】为新的内容编辑模态框添加逻辑
+    const editContentModal = document.getElementById('editContentModal');
+    const saveContentChangesBtn = document.getElementById('saveContentChangesBtn');
+    saveContentChangesBtn.addEventListener('click', async () => {
+        const shareId = editContentModal.dataset.editingShareId;
+        if (!shareId) return;
+
+        const newContent = document.getElementById('editContentTextarea').value;
+        
+        saveContentChangesBtn.disabled = true;
+        saveContentChangesBtn.textContent = '保存中...';
+
+        try {
+            const res = await fetch(\`/api/shares/\${encodeURIComponent(shareId)}\`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: newContent })
+            });
+
+            if (res.ok) {
+                alert('内容更新成功！');
+                editContentModal.style.display = 'none';
+                loadShareList();
+            } else {
+                const error = await res.text();
+                alert(\`更新失败: \${error}\`);
+            }
+        } catch (e) {
+            alert('发生网络错误，请重试。');
+        } finally {
+            saveContentChangesBtn.disabled = false;
+            saveContentChangesBtn.textContent = '保存更改';
+        }
+    });
+
+
     function formatTimestamp(timestamp) {
         if (!timestamp) return '永久';
         const date = new Date(timestamp);
@@ -782,7 +850,6 @@ const htmlTemplate = `
                 throw new Error('Failed to load shares');
             }
             currentShares = await response.json();
-            // 默认按创建时间从新到旧排序
             currentShares.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
             renderShareList(currentShares);
         } catch(e) {
@@ -790,7 +857,7 @@ const htmlTemplate = `
         }
     }
 
-    // 【修改】将渲染逻辑独立成一个函数
+    // 将渲染逻辑独立成一个函数
     function renderShareList(shares) {
         if (shares.length === 0) {
             shareListContainer.innerHTML = '<p>暂无分享链接。</p>';
@@ -817,7 +884,8 @@ const htmlTemplate = `
                         <td>\${share.views} / \${share.maxViews === null ? '∞' : share.maxViews}</td>
                         <td>\${formatTimestamp(share.expireAt)}</td>
                         <td>
-                            <button class="action-btn edit-btn" data-id="\${share.id}">编辑</button>
+                            <button class="action-btn edit-content-btn" data-id="\${share.id}">内容</button>
+                            <button class="action-btn edit-settings-btn" data-id="\${share.id}">设置</button>
                             <button class="action-btn delete-btn" data-id="\${share.id}">删除</button>
                         </td>
                     </tr>
